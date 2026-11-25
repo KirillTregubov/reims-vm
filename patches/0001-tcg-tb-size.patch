@@ -1,0 +1,40 @@
+diff --git i/crates/reims-ctl/src/host.rs w/crates/reims-ctl/src/host.rs
+index cd2da3b..bda3499 100644
+--- i/crates/reims-ctl/src/host.rs
++++ w/crates/reims-ctl/src/host.rs
+@@ -207,10 +207,12 @@ impl Profile {
+     /// QEMU's `-accel` for it on `host`: [`Profile::accel`] with its options. An arm64 guest runs
+     /// with the GIC in the kernel on HVF, and on TCG a thread for each vCPU; these are the options
+     /// Ambrosia's boot check runs it with (firmware/ambrosia/check-boot.sh).
++    /// TCG gets the x86-64 maximum 2 GiB translation cache: macOS fills the default 1 GiB about
++    /// once a minute, and each full cache is flushed and retranslated.
+     pub fn accel_arg(self, host: Host) -> &'static str {
+         match (self, self.accel(host)) {
+             (Profile::VmappleArm64, "hvf") => "hvf,kernel-irqchip=on",
+-            (Profile::VmappleArm64, "tcg") => "tcg,thread=multi",
++            (Profile::VmappleArm64, "tcg") => "tcg,thread=multi,tb-size=2048",
+             (_, accel) => accel,
+         }
+     }
+@@ -274,7 +276,7 @@ mod tests {
+         assert_eq!(Profile::Q35X86_64.accel_arg(linux), "kvm");
+         let arm = Profile::VmappleArm64;
+         assert_eq!(arm.accel(linux), "tcg");
+-        assert_eq!(arm.accel_arg(linux), "tcg,thread=multi");
++        assert_eq!(arm.accel_arg(linux), "tcg,thread=multi,tb-size=2048");
+         assert!(arm.memfd_ram(linux) && arm.gpu_choice(linux));
+         assert!(!arm.ram_whole_at_start(linux));
+         assert!(arm.describe(linux).ends_with("emulated by TCG)"));
+diff --git i/crates/reims-ctl/src/qemu.rs w/crates/reims-ctl/src/qemu.rs
+index 0f3a5c3..18749ca 100644
+--- i/crates/reims-ctl/src/qemu.rs
++++ w/crates/reims-ctl/src/qemu.rs
+@@ -943,7 +943,7 @@ mod tests {
+         let want = arm64_command_line(
+             &[
+                 "-accel",
+-                "tcg,thread=multi",
++                "tcg,thread=multi,tb-size=2048",
+                 "-machine",
+                 "vmapple,uuid=0x9e35f01edc0c5536,memory-backend=ram,dump-guest-core=off",
+                 "-m",

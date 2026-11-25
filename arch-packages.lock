@@ -1,0 +1,7 @@
+# SHA-256  URL
+# Packages the build needs at an exact version, from the Arch Linux Archive, whose URLs are permanent.
+d9584c21e1556ae02650ccbd769e838d7aec286b0b092e6b43aac10e3bade240 https://archive.archlinux.org/packages/l/libslirp/libslirp-4.9.5-1-x86_64.pkg.tar.zst
+c377d325b42c4250102615e779cdeb67816a176cd0c55c018f7c81920057eb43 https://archive.archlinux.org/packages/d/dtc/dtc-1%3A1.8.1-1-x86_64.pkg.tar.zst
+aa9df517c035390c648a98156f48831535534b0ce28d4714050f8a253cd6a5d4 https://archive.archlinux.org/packages/s/spice-protocol/spice-protocol-0.14.5-1-any.pkg.tar.zst
+a9c6d49c62ceabecaf0c11c27515d0a1222186a1b033e9d7c2b03cefd635484d https://archive.archlinux.org/packages/l/libcacard/libcacard-2.8.1-1-x86_64.pkg.tar.zst
+14d4e6a852f87b5dfee37f6a4f0b78dfbbdf8039f7d171511b00d9641e1323d3 https://archive.archlinux.org/packages/s/spice/spice-0.16.0-4-x86_64.pkg.tar.zst

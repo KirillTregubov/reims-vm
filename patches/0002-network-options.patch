@@ -1,0 +1,124 @@
+diff --git i/crates/reims-ctl/src/cli.rs w/crates/reims-ctl/src/cli.rs
+index 4282560..1cb7cc8 100644
+--- i/crates/reims-ctl/src/cli.rs
++++ w/crates/reims-ctl/src/cli.rs
+@@ -583,6 +583,10 @@ pub struct SetArgs {
+     /// 0 for none
+     #[arg(long)]
+     pub ssh_port: Option<u16>,
++    /// More QEMU user-network options, appended as given (commas inside a value doubled), such
++    /// as guestfwd=tcp:10.0.2.4:445-cmd:PROGRAM; empty for none
++    #[arg(long, allow_hyphen_values = true)]
++    pub network_options: Option<String>,
+     /// The network card's MAC, such as 52:54:00:12:34:56
+     #[arg(long)]
+     pub mac: Option<String>,
+@@ -1191,10 +1195,14 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
+         if !c.network.enabled {
+             "off".into()
+         } else {
+-            match c.network.ssh_port {
++            let mut n = match c.network.ssh_port {
+                 Some(p) => format!("user, mac {}, ssh on 127.0.0.1:{p}", c.network.mac),
+                 None => format!("user, mac {}", c.network.mac),
++            };
++            if let Some(o) = &c.network.options {
++                n.push_str(&format!(", options {o}"));
+             }
++            n
+         },
+     );
+     if !c.host_disks.is_empty() {
+@@ -1393,6 +1401,9 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
+     if let Some(p) = a.ssh_port {
+         c.network.ssh_port = vm::ssh_port(p);
+     }
++    if let Some(o) = &a.network_options {
++        c.network.options = (!o.is_empty()).then(|| o.clone());
++    }
+     if let Some(m) = &a.mac {
+         c.network.mac = m.clone();
+     }
+diff --git i/crates/reims-ctl/src/create.rs w/crates/reims-ctl/src/create.rs
+index 98a2fcb..1130a0b 100644
+--- i/crates/reims-ctl/src/create.rs
++++ w/crates/reims-ctl/src/create.rs
+@@ -497,6 +497,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
+             enabled: spec.network,
+             mac: spec.mac.clone().unwrap_or_else(random_mac),
+             ssh_port: spec.ssh_port.and_then(ssh_port),
++            options: None,
+         },
+         logs: Logs {
+             enabled: spec.logs,
+diff --git i/crates/reims-ctl/src/qemu.rs w/crates/reims-ctl/src/qemu.rs
+index 18749ca..d0658a5 100644
+--- i/crates/reims-ctl/src/qemu.rs
++++ w/crates/reims-ctl/src/qemu.rs
+@@ -620,6 +620,10 @@ fn netdev(vm: &Vm) -> String {
+     if let Some(p) = vm.config.network.ssh_port {
+         n.push_str(&format!(",hostfwd=tcp:127.0.0.1:{p}-:22"));
+     }
++    if let Some(o) = &vm.config.network.options {
++        n.push(',');
++        n.push_str(o);
++    }
+     n
+ }
+ 
+@@ -808,6 +812,7 @@ mod tests {
+                     enabled: true,
+                     mac: "52:54:00:aa:bb:cc".into(),
+                     ssh_port: Some(2326),
++                    options: None,
+                 },
+                 logs: Logs::default(),
+                 q35: Some(Q35 {
+@@ -1089,6 +1094,16 @@ mod tests {
+         assert!(has(&inv.args, &["-netdev", "user,id=net0,ipv6=off"]));
+         assert!(has(&inv.args, &["-serial", "file:/vms/t/logs/serial.log"]));
+         assert!(inv.env.iter().any(|(k, _)| k == "REIMS_VGPU_LOG"));
++        vm.config.network.options = Some("guestfwd=tcp:10.0.2.4:445-cmd:/usr/bin/smbd -s c".into());
++        let inv = invocation(&vm, &arm64_ctx(mac())).unwrap();
++        assert!(has(
++            &inv.args,
++            &[
++                "-netdev",
++                "user,id=net0,ipv6=off,guestfwd=tcp:10.0.2.4:445-cmd:/usr/bin/smbd -s c"
++            ]
++        ));
++        vm.config.network.options = None;
+         vm.config.network.enabled = false;
+         let inv = invocation(&vm, &arm64_ctx(mac())).unwrap();
+         assert!(has(&inv.args, &["-nic", "none"]));
+diff --git i/crates/reims-ctl/src/vm.rs w/crates/reims-ctl/src/vm.rs
+index e8b8e92..f2854c3 100644
+--- i/crates/reims-ctl/src/vm.rs
++++ w/crates/reims-ctl/src/vm.rs
+@@ -427,6 +427,10 @@ pub struct Network {
+         deserialize_with = "saved_ssh_port"
+     )]
+     pub ssh_port: Option<u16>,
++    /// More options for the user network's QEMU netdev, appended as given, such as
++    /// `guestfwd=tcp:10.0.2.4:445-cmd:...` to serve the guest from a host program.
++    #[serde(skip_serializing_if = "Option::is_none")]
++    pub options: Option<String>,
+ }
+ 
+ /// The SSH forward from host port `p`: none for 0, wherever a port is given, as QEMU's
+@@ -449,6 +453,7 @@ impl Default for Network {
+             enabled: true,
+             mac: random_mac(),
+             ssh_port: None,
++            options: None,
+         }
+     }
+ }
+@@ -1291,6 +1296,7 @@ pub(crate) mod tests {
+                 enabled: true,
+                 mac: "52:54:00:01:02:03".into(),
+                 ssh_port: Some(2222),
++                options: None,
+             },
+             logs: Logs::default(),
+             q35: Some(Q35 {

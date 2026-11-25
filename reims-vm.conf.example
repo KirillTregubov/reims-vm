@@ -1,0 +1,27 @@
+# reims-vm settings. Copy this file to reims-vm.conf (or let `bin/reims-vm config edit`
+# create it) and uncomment what you want to change. It's a shell file of KEY=value lines;
+# quote values with spaces. Changes apply the next time the VM starts.
+
+# The VM's name. Set it before `create`; changing it later points at a different VM.
+#VM=macos
+
+# vCPUs for the guest, 1 up to your CPU threads. Default: half your CPU threads.
+#CPUS=6
+
+# Guest memory, 4G up to your RAM minus 2G. Default: half your RAM.
+# Lower it if the host starts swapping.
+#MEMORY=12G
+
+# The VM's disk size, 64G to 4096G. Used only by `create`: it can't be changed afterwards.
+# The disk is sparse, so it takes only the space macOS actually uses. Default: 128G.
+#DISK=256G
+
+# A folder shared with macOS (full path), at smb://10.0.2.4/<SHARE_NAME>. Default: none.
+#SHARE=/home/you/Shared
+
+# The name macOS connects to. Default: the folder's name, saved here the first time a folder
+# is shared, so macOS's saved address keeps working if you change SHARE.
+#SHARE_NAME=Shared
+
+# Where `backup` writes. Must be on the same filesystem as .state/. Default: backups/ here.
+#BACKUP_DIR=/path/to/backups

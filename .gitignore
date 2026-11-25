@@ -1,0 +1,5 @@
+.state/
+backups/
+reims-vm.conf
+*.ipsw
+*.img

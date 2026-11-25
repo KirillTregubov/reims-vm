@@ -1,0 +1,607 @@
+#!/usr/bin/env bash
+# Builds a pinned Reims and drives one macOS VM with it. See README.md.
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")/.." && pwd -P)
+state=$root/.state
+source_dir=$state/reims-vgpu
+packages=$state/arch
+pin=f1c518d312f75715c73dbc2a4ca1f6ebca1b12f9
+repo=https://github.com/steelbrain/reims-vgpu.git
+bin=$state/install/bin
+data=$state/data/reims-ctl
+conf=$root/reims-vm.conf
+
+# Settings, overridden by reims-vm.conf (README, "Settings"). CPUS and MEMORY default to half the host's.
+host_cpus=$(nproc)
+host_gib=$(awk '/^MemTotal:/ { print int($2 / 1048576) }' /proc/meminfo)
+VM=macos
+CPUS=$(( host_cpus > 1 ? host_cpus / 2 : 1 ))
+MEMORY=$(( host_gib / 2 ))G
+DISK=128G
+SHARE=
+SHARE_NAME=
+BACKUP_DIR=$root/backups
+if [[ -f $conf ]]; then
+  # shellcheck source=/dev/null
+  source "$conf"
+fi
+
+fail() { printf 'reims-vm: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Usage: ${0##*/} COMMAND
+
+Setup:
+  create [VERSION|IPSW]  set up everything and boot into macOS setup: asks for settings,
+                         builds Reims if needed, downloads macOS (default: latest), creates
+                         the VM and completes its first boot
+  preflight              check this host for what the build and the VM need
+  install                build (or rebuild) the pinned Reims and QEMU into .state/
+  check                  run reims-ctl's host and GPU checks
+
+Use:
+  start | stop | list    run, shut down or list the VM (start completes an unfinished
+                         first boot)
+  share [DIR | --off]    show, set or clear the folder shared with the guest
+  backup                 reflink copy of the stopped VM into the backup folder
+  config [edit]          show the settings, or change them with prompts
+  diagnostics            turn on the guest serial log (logs in .state/.../vms/VM/logs)
+  ctl ARGS...            run reims-ctl inside the sandbox
+EOF
+}
+
+# Sets KEY=VALUE in reims-vm.conf in place, so the file's comments and order stay: on KEY's line,
+# else under its commented-out example line, else at the end. An empty VALUE removes KEY's line.
+# A new reims-vm.conf starts as a copy of reims-vm.conf.example.
+config_set() {
+  local line= tmp
+  [[ -f $conf ]] || cp -- "$root/reims-vm.conf.example" "$conf"
+  [[ -z $2 ]] || line=$(printf '%s=%q' "$1" "$2")
+  tmp=$(mktemp "$conf.XXXXXX")
+  KEY=$1 LINE=$line awk '
+    { text[NR] = $0 }
+    !set && $0 ~ "^" ENVIRON["KEY"] "=" { set = NR }
+    !example && $0 ~ "^#" ENVIRON["KEY"] "=" { example = NR }
+    END {
+      line = ENVIRON["LINE"]
+      at = set ? set : (line != "" ? example : 0)
+      for (i = 1; i <= NR; i++) {
+        if (text[i] ~ "^" ENVIRON["KEY"] "=") {
+          if (i == at && line != "") print line
+          continue
+        }
+        print text[i]
+        if (i == at) print line
+      }
+      if (!at && line != "") print line
+    }' "$conf" > "$tmp"
+  mv -- "$tmp" "$conf"
+}
+
+# Each check_* prints the normalized value, or an error on stderr and returns 1.
+check_vm() {
+  [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] && printf '%s\n' "$1" ||
+    { printf 'use letters, digits, dots, dashes and underscores\n' >&2; return 1; }
+}
+check_cpus() {
+  [[ $1 =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= host_cpus )) && printf '%s\n' "$1" ||
+    { printf 'a whole number from 1 to %s (this host'"'"'s CPU threads)\n' "$host_cpus" >&2; return 1; }
+}
+# The disk is sparse, so its size is a cap, not space used up front. Only `create` uses it.
+check_disk() {
+  local gib=${1%[Gg]}
+  [[ $gib =~ ^[0-9]+$ ]] && (( gib >= 64 && gib <= 4096 )) && printf '%sG\n' "$gib" ||
+    { printf 'GiB from 64 to 4096, such as 128G\n' >&2; return 1; }
+}
+check_memory() {
+  local gib=${1%[Gg]}
+  [[ $gib =~ ^[0-9]+$ ]] && (( gib >= 4 && gib <= host_gib - 2 )) && printf '%sG\n' "$gib" ||
+    { printf 'GiB from 4 to %s (this host has %s GiB; leave it some)\n' "$(( host_gib - 2 ))" "$host_gib" >&2; return 1; }
+}
+check_share() {
+  [[ -n $1 ]] || return 0
+  local dir
+  dir=$(realpath -e -- "${1/#\~/$HOME}" 2>/dev/null) && [[ -d $dir ]] ||
+    { printf '%s is not a folder\n' "$1" >&2; return 1; }
+  [[ $dir != / && $dir != "$HOME" ]] || { printf 'share a subfolder, not %s itself\n' "$dir" >&2; return 1; }
+  [[ $dir != *$'\n'* ]] || { printf 'the folder path must not contain a newline\n' >&2; return 1; }
+  printf '%s\n' "$dir"
+}
+
+# The shared folder: QEMU's user network starts an smbd for each guest connection to 10.0.2.4:445
+# (guestfwd), with smb_conf's config. It runs as you inside the VM's sandbox, so it needs no root
+# and nothing else can reach it. Its state lives in the sandbox's own /tmp: smbd's socket paths
+# must stay short, and the state goes away with the VM.
+smb_dir=/tmp/reims-smb
+# The address is QEMU's usual one for a guest-side server (its own smb= uses it too); slirp
+# refuses the host's 10.0.2.2 and the DNS server's 10.0.2.3 for a forward.
+share_ip=10.0.2.4
+# The share's name is what macOS connects to, so it is pinned in reims-vm.conf the first time a
+# folder is shared (the folder's name, by default) and kept when the folder changes.
+share_name() {
+  local name=${SHARE##*/}
+  if [[ -n $SHARE_NAME ]]; then
+    printf '%s' "$SHARE_NAME"
+  elif [[ $name =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+    printf '%s' "$name"
+  else
+    printf 'Shared'
+  fi
+}
+pin_share_name() {
+  [[ -n $SHARE_NAME ]] && return
+  SHARE_NAME=$(share_name)
+  config_set SHARE_NAME "$SHARE_NAME"
+}
+share_url() { printf 'smb://%s/%s' "$share_ip" "$(share_name)"; }
+check_share_name() {
+  [[ $1 =~ ^[A-Za-z0-9._-]{1,64}$ ]] && printf '%s\n' "$1" ||
+    { printf 'letters, digits, dots, dashes and underscores, up to 64\n' >&2; return 1; }
+}
+smb_conf() {
+  cat <<EOF
+# Written by reims-vm for the VM's shared folder.
+[global]
+   server role = standalone server
+   security = user
+   map to guest = Bad User
+   interfaces = 127.0.0.1
+   bind interfaces only = yes
+   disable netbios = yes
+   load printers = no
+   printing = bsd
+   printcap name = /dev/null
+   disable spoolss = yes
+   usershare max shares = 0
+   private dir = $smb_dir
+   lock directory = $smb_dir
+   state directory = $smb_dir
+   cache directory = $smb_dir
+   pid directory = $smb_dir
+   ncalrpc dir = $smb_dir/ncalrpc
+   max log size = 1000
+   # macOS: keep Finder metadata and resource forks in extended attributes, not ._ files.
+   vfs objects = fruit streams_xattr
+   fruit:metadata = stream
+   fruit:model = MacSamba
+   fruit:posix_rename = yes
+   fruit:veto_appledouble = no
+   fruit:nfs_aces = no
+   fruit:wipe_intentionally_left_blank_rfork = yes
+   fruit:delete_empty_adfiles = yes
+
+[$(share_name)]
+   path = $SHARE
+   read only = no
+   guest ok = yes
+   guest only = yes
+   force user = $USER
+   create mask = 0644
+   directory mask = 0755
+EOF
+}
+
+# Hand-edited settings get the prompts' checks: setting KEY CHECK normalizes KEY or fails naming it.
+setting() {
+  local out
+  out=$("$2" "${!1}" 2>&1) || fail "$1=${!1} in ${conf##*/}: $out"
+  printf -v "$1" '%s' "$out"
+}
+check_settings() {
+  setting VM check_vm
+  setting CPUS check_cpus
+  setting MEMORY check_memory
+  setting DISK check_disk
+  [[ -z $SHARE ]] || setting SHARE check_share
+  [[ -z $SHARE_NAME ]] || setting SHARE_NAME check_share_name
+}
+
+# ask VAR CHECK PROMPT: asks until CHECK accepts the answer, offering VAR's value to edit.
+ask() {
+  local var=$1 check=$2 prompt=$3 reply value
+  while :; do
+    read -r -e -p "$prompt: " -i "${!var}" reply || exit 1
+    if value=$("$check" "$reply"); then
+      printf -v "$var" '%s' "$value"
+      return
+    fi
+  done
+}
+
+config_edit() {
+  [[ -t 0 ]] || fail 'config edit asks questions: run it in a terminal, or edit reims-vm.conf'
+  printf 'Press Enter to keep a value. This host has %s CPU threads and %s GiB of memory.\n' \
+    "$host_cpus" "$host_gib"
+  # The name picks which VM the rest applies to, and the disk is made once, so both are asked
+  # only until that VM exists.
+  local new_vm=0
+  if [[ -f $data/vms/$VM/vm.toml ]]; then
+    printf 'VM name: %s (already created)\n' "$VM"
+  else
+    new_vm=1
+    ask VM check_vm 'VM name'
+    ask DISK check_disk "Disk size (GiB, e.g. 128G; it can't be changed later)"
+  fi
+  ask CPUS check_cpus 'vCPUs'
+  ask MEMORY check_memory 'Memory (GiB, e.g. 15G)'
+  ask SHARE check_share 'Shared folder (empty for none)'
+  if [[ -n $SHARE ]]; then
+    SHARE_NAME=$(share_name)
+    ask SHARE_NAME check_share_name 'Share name, as macOS connects to it'
+  fi
+  [[ -z $SHARE ]] || command -v smbd >/dev/null ||
+    printf 'note: sharing needs smbd: sudo pacman -S samba\n'
+  config_set VM "$VM"
+  config_set CPUS "$CPUS"
+  config_set MEMORY "$MEMORY"
+  (( ! new_vm )) || config_set DISK "$DISK"
+  config_set SHARE "$SHARE"
+  [[ -z $SHARE_NAME ]] || config_set SHARE_NAME "$SHARE_NAME"
+  printf 'Saved to %s. vCPUs, memory and the shared folder apply from the next start.\n' "$conf"
+}
+
+action=${1:-}
+[[ -n $action ]] || { usage >&2; exit 2; }
+if [[ $action == -h || $action == --help || $action == help ]]; then
+  usage
+  exit 0
+fi
+
+# Host packages the sandbox borrows (it mounts / read-only) and the build needs.
+# Mirrors scripts/install-ctl.sh's pacman_pkgs in the pinned reims-vgpu, plus what this script uses.
+# libslirp, dtc and spice are not here: arch-packages.lock stages those. rustup comes from find_rustup.
+host_pkgs=(bubblewrap git curl libarchive util-linux
+  base-devel python ninja pkgconf flex bison bzip2 cmake clang
+  glib2 pixman zlib pipewire libpulse alsa-lib libusb gnutls vulkan-icd-loader
+  libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
+  wayland libdecor mesa libdrm dbus systemd-libs gtk3)
+
+# The host's rustup executable, which the build runs with its own RUSTUP_HOME and CARGO_HOME so
+# rust-toolchain.toml's pinned nightly lands in .state. Looked up as reims-vgpu's install-ctl.sh
+# does: Cargo's home first (rustup.rs, and mise, which installs rustup there), then PATH (pacman).
+# The path is resolved, since rustup's proxies pick the tool by name, and checked to be rustup:
+# a version manager's shim (mise's) resolves to the manager itself.
+find_rustup() {
+  local candidate real
+  for candidate in "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" "$(command -v rustup)"; do
+    [[ -n $candidate && -x $candidate ]] || continue
+    real=$(realpath -- "$candidate") || continue
+    if env -u RUSTUP_TOOLCHAIN RUSTUP_AUTO_INSTALL=0 "$real" --version 2>/dev/null | grep -q '^rustup '; then
+      printf '%s\n' "$real"; return 0
+    fi
+  done
+  return 1
+}
+
+preflight() {
+  local ok=1 missing=() p avail
+  check_settings
+  [[ $(uname -sm) == 'Linux x86_64' ]] || { printf 'x86-64 Linux required\n'; ok=0; }
+  command -v pacman >/dev/null || { printf 'Arch (pacman) required\n'; ok=0; }
+  for p in "${host_pkgs[@]}"; do
+    pacman -Qq "$p" >/dev/null 2>&1 || pacman -Qqg "$p" >/dev/null 2>&1 || missing+=("$p")
+  done
+  if (( ${#missing[@]} )); then
+    printf 'missing packages: sudo pacman -S --needed %s\n' "${missing[*]}"
+    local reply=n
+    [[ ! -t 0 ]] || read -r -p 'Install them now? [Y/n] ' reply || true
+    if [[ ${reply:-y} == [Yy]* ]] && sudo pacman -S --needed "${missing[@]}"; then
+      missing=()
+    else
+      ok=0
+    fi
+  fi
+  find_rustup >/dev/null || { printf 'rustup missing: sudo pacman -S rustup, or install it from https://rustup.rs\n'; ok=0; }
+  if [[ -c /dev/udmabuf ]]; then
+    [[ -r /dev/udmabuf && -w /dev/udmabuf ]] || { printf '/dev/udmabuf not accessible: sudo usermod -aG kvm %s, then log out and in\n' "$USER"; ok=0; }
+  else
+    printf '/dev/udmabuf missing: sudo modprobe udmabuf (and add it to /etc/modules-load.d/udmabuf.conf)\n'; ok=0
+  fi
+  compgen -G '/dev/dri/renderD*' >/dev/null || { printf 'no GPU render node in /dev/dri\n'; ok=0; }
+  # A Vulkan driver for a real GPU: an ICD manifest other than Mesa's software renderer (lvp).
+  local icd gpu_vulkan=0
+  for icd in /usr/share/vulkan/icd.d/*.json /etc/vulkan/icd.d/*.json; do
+    if [[ -f $icd && ${icd##*/} != lvp_icd* ]]; then gpu_vulkan=1; fi
+  done
+  (( gpu_vulkan )) ||
+    { printf 'no Vulkan driver for your GPU: install nvidia-utils, vulkan-radeon or vulkan-intel\n'; ok=0; }
+  [[ -n ${WAYLAND_DISPLAY:-} ]] || printf 'note: no WAYLAND_DISPLAY; run start from your desktop session\n'
+  bwrap --ro-bind / / --overlay-src /usr --overlay-src /var/tmp --ro-overlay /usr true 2>/dev/null ||
+    { printf 'bubblewrap overlay mounts do not work here (kernel/user namespaces?)\n'; ok=0; }
+  if [[ -n $SHARE ]]; then
+    command -v smbd >/dev/null || { printf 'SHARE is set but smbd is missing: sudo pacman -S samba\n'; ok=0; }
+    [[ -d $SHARE ]] || { printf 'shared folder %s does not exist\n' "$SHARE"; ok=0; }
+  fi
+  avail=$(df --output=avail -BG "$root" | tail -1 | tr -dc 0-9)
+  (( avail >= 150 )) || { printf 'only %s GiB free here; the build, IPSW and disk want ~150 GiB\n' "$avail"; ok=0; }
+  (( ok )) && printf 'preflight: ok\n' || { printf 'preflight: fix the items above\n'; return 1; }
+}
+
+# The commands that need no sandbox.
+case "$action" in
+  preflight) preflight; exit ;;
+  config)
+    if [[ ${2:-} == edit ]]; then
+      config_edit
+      exit
+    fi
+    [[ -z ${2:-} ]] || fail 'config takes no argument, or edit'
+    disk=$DISK
+    # Once the VM exists, its disk is what create made; DISK only matters for a new VM.
+    if [[ -f $data/vms/$VM/disk.img ]]; then
+      disk="$(( $(stat -c %s "$data/vms/$VM/disk.img") >> 30 ))G  # $VM's disk, fixed at create"
+    fi
+    printf 'VM=%q\nCPUS=%q\nMEMORY=%q\nDISK=%s\nSHARE=%q\nSHARE_NAME=%q\nBACKUP_DIR=%q\n' "$VM" "$CPUS" "$MEMORY" "$disk" "$SHARE" "$(share_name)" "$BACKUP_DIR"
+    [[ -f $conf ]] && printf '# from %s\n' "$conf" || printf '# defaults (no %s)\n' "$conf"
+    exit
+    ;;
+  share)
+    case "${2:-}" in
+      '') ;;
+      --off) config_set SHARE ''; SHARE= ;;
+      *)
+        [[ $# -eq 2 ]] || fail 'share takes one folder, or --off'
+        dir=$(check_share "$2" 2>&1) || fail "$dir"
+        command -v smbd >/dev/null || printf 'reims-vm: note: sharing needs smbd: sudo pacman -S samba\n' >&2
+        config_set SHARE "$dir"; SHARE=$dir
+        pin_share_name
+        ;;
+    esac
+    if [[ -n $SHARE ]]; then
+      printf 'reims-vm: sharing %s at %s from the next start\n' "$SHARE" "$(share_url)"
+    else
+      printf 'reims-vm: no shared folder (optional): %s share DIR\n' "${0##*/}"
+    fi
+    exit
+    ;;
+esac
+
+[[ $(uname -sm) == 'Linux x86_64' ]] || fail 'this setup is for x86-64 Linux'
+(( EUID != 0 )) || fail 'run as your regular desktop user'
+command -v bwrap >/dev/null || fail 'bubblewrap is required'
+[[ ! -L $state ]] || fail 'the state directory must be local to this setup'
+mkdir -p "$state"
+
+sandbox=(
+  --ro-bind / /
+  --dev /dev
+  --dev-bind-try /dev/dri /dev/dri
+  --dev-bind-try /dev/udmabuf /dev/udmabuf
+  --dev-bind-try /dev/kvm /dev/kvm
+  --proc /proc
+  --tmpfs /tmp
+  --bind "$state" "$state"
+)
+for device in /dev/nvidia[0-9]* /dev/nvidiactl /dev/nvidia-modeset /dev/nvidia-uvm /dev/nvidia-uvm-tools; do
+  [[ ! -c $device ]] || sandbox+=(--dev-bind "$device" "$device")
+done
+
+run_local() {
+  [[ -f $packages/ready ]] || fail 'run the install command first'
+  bwrap "${sandbox[@]}" \
+    --overlay-src /usr --overlay-src "$packages/usr" --ro-overlay /usr \
+    --overlay-src /var/lib/pacman/local --overlay-src "$packages/db/local" --ro-overlay /var/lib/pacman/local \
+    --setenv CARGO_HOME "$state/cargo" \
+    --setenv RUSTUP_HOME "$state/rustup" \
+    --unsetenv RUSTUP_TOOLCHAIN \
+    --setenv CARGO_INSTALL_ROOT "$state/install" \
+    --setenv REIMS_INSTALL_SKIP_HOST_CHECKS 1 \
+    --setenv XDG_DATA_HOME "$state/data" \
+    --setenv XDG_CACHE_HOME "$state/cache" \
+    --setenv REIMS_CTL_CONFIG_DIR "$state/config" \
+    --setenv REIMS_CTL_DATA_DIR "$data" \
+    --setenv PATH "$bin:$state/cargo/bin:/usr/bin" \
+    --chdir "$state" "$@"
+}
+
+stage_packages() {
+  local lock_id saved_id digest url archive name next
+  # Identify the lock by its checksums only, so pointing a package at another mirror doesn't restage.
+  lock_id=$(awk '$1 !~ /^#/ && NF { print $1 }' "$root/arch-packages.lock" | sha256sum)
+  lock_id=${lock_id%% *}
+  saved_id=$(cat "$packages/ready" 2>/dev/null || true)
+  [[ $saved_id != "$lock_id" ]] || return 0
+
+  next=$(mktemp -d "$state/arch.XXXXXXXX")
+  mkdir -p "$state/downloads" "$next/db" "$next/root" "$next/usr"
+  local -a archives=()
+  while read -r digest url; do
+    [[ $digest && $digest != \#* ]] || continue
+    name=${url##*/}
+    archive=$state/downloads/$name
+    if [[ ! -f $archive ]] || ! printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --status; then
+      curl --fail --silent --show-error --location --retry 3 --output "$archive.partial" "$url"
+      printf '%s  %s\n' "$digest" "$archive.partial" | sha256sum --check --status ||
+        fail "checksum mismatch for $name"
+      mv -- "$archive.partial" "$archive"
+    fi
+    bsdtar --no-same-owner --no-same-permissions -xf "$archive" -C "$next" usr
+    archives+=("$archive")
+  done < "$root/arch-packages.lock"
+  (( ${#archives[@]} > 0 )) || fail 'the package lock file is empty'
+
+  # Record the verified archives in a project-local package database.
+  printf '[options]\nArchitecture = auto\nSigLevel = Never\n' > "$next/pacman.conf"
+  bwrap "${sandbox[@]}" --unshare-user --uid 0 --gid 0 -- /usr/bin/pacman \
+    --config "$next/pacman.conf" --root "$next/root" --dbpath "$next/db" \
+    --logfile "$next/pacman.log" -Udd --dbonly --noscriptlet --noconfirm "${archives[@]}"
+  printf '%s\n' "$lock_id" > "$next/ready"
+  if [[ -e $packages ]]; then
+    fail "package lock changed. Move $packages aside before rebuilding"
+  fi
+  mv -- "$next" "$packages"
+}
+
+install_reims() {
+  exec 9>"$state/install.lock"
+  flock 9
+  stage_packages
+  if [[ ! -d $source_dir/.git ]]; then
+    git init --quiet "$source_dir"
+    git -C "$source_dir" remote add origin "$repo"
+  fi
+  [[ $(git -C "$source_dir" remote get-url origin) == "$repo" ]] || fail 'unexpected source remote'
+  if [[ $(git -C "$source_dir" rev-parse --verify HEAD 2>/dev/null || true) != "$pin" ]]; then
+    git -C "$source_dir" fetch --depth 1 origin "$pin"
+    git -C "$source_dir" checkout --force --detach "$pin"
+  fi
+  # Local patches on top of the pin, applied once and in order (see README, "Patches").
+  local patch
+  for patch in "$root"/patches/*.patch; do
+    [[ -f $patch ]] || continue
+    git -C "$source_dir" apply --reverse --check "$patch" 2>/dev/null && continue
+    git -C "$source_dir" apply "$patch" || fail "could not apply ${patch##*/}"
+  done
+  # Linked each time, so a rustup that moved, or a link to something else, is corrected.
+  local rustup tool
+  rustup=$(find_rustup) || fail 'rustup missing: sudo pacman -S rustup, or install it from https://rustup.rs'
+  mkdir -p "$state/cargo/bin"
+  for tool in rustup cargo rustc rustdoc; do
+    ln -sfn -- "$rustup" "$state/cargo/bin/$tool"
+  done
+  run_local -- /usr/bin/bash "$source_dir/scripts/install-ctl.sh" </dev/null
+}
+
+vm_dir=$data/vms/$VM
+vm_running() { [[ -f $vm_dir/qemu.pid ]] && kill -0 "$(< "$vm_dir/qemu.pid")" 2>/dev/null; }
+# create leaves these until the first boot is finished (reims-restore finish-eacs).
+first_boot_pending() { [[ -f $vm_dir/isc.pre-eacs ]]; }
+
+# Starts the VM with reims-vm.conf's settings, serving the shared folder if there is one.
+launch() {
+  local options= smbd
+  if [[ -n $SHARE ]]; then
+    [[ -d $SHARE ]] || fail "shared folder $SHARE does not exist (${0##*/} share --off stops sharing)"
+    smbd=$(command -v smbd) || fail 'sharing needs smbd: sudo pacman -S samba'
+    # slirp splits the command on spaces, and QEMU's options on commas.
+    [[ $smbd != *[[:space:],]* ]] || fail "smbd's path ($smbd) must have no spaces or commas"
+    options="guestfwd=tcp:$share_ip:445-cmd:$smbd -l $smb_dir -s $smb_dir/smb.conf"
+  fi
+  # reims-vm.conf is the source of truth: sync it into the VM's reims-ctl settings on every start.
+  run_local -- "$bin/reims-ctl" set "$VM" --cpus "$CPUS" --memory "$MEMORY" --network-options "$options" >/dev/null
+  if [[ -z $SHARE ]]; then
+    run_local -- "$bin/reims-ctl" start "$VM"
+    return
+  fi
+  # QEMU, and the smbd it starts, run in this sandbox, which sees the rest of / read-only.
+  local -a base=("${sandbox[@]}")
+  sandbox+=(--bind "$SHARE" "$SHARE" --dir "$smb_dir" --file 3 "$smb_dir/smb.conf"
+    --symlink "$state/smbd.log" "$smb_dir/log.smbd")
+  run_local -- "$bin/reims-ctl" start "$VM" 3< <(smb_conf)
+  sandbox=("${base[@]}")
+}
+
+# The first boot: macOS makes its encrypted Data volume and resets the VM, and then the
+# firmware stops with one of these lines in the serial log (reims-vgpu's
+# firmware/ambrosia/check-boot.sh watches for the same), because only the finish step can
+# make the VM bootable again. So: boot, wait for the line, power off, finish. finish-eacs
+# refuses, changing nothing, until macOS has made its keys, and after a failed first boot
+# prepares another try itself, so this loop only ever retries what it asks for.
+firmware_stop='^ambrosia: (bad configuration|bad graphics driver|can.t read the boot objects|boot failed|exception [0-9]|panic:)'
+
+wait_for_first_boot() {
+  local log=$vm_dir/logs/serial.log start=$SECONDS line
+  printf 'reims-vm: first boot. macOS is creating its Data volume and restarts when done; this\n'
+  printf '          takes a while under emulation. Leave the VM window alone. Ctrl+C stops\n'
+  printf '          waiting (the VM keeps going); run %s start to pick up again.\n' "${0##*/}"
+  trap 'printf "\nreims-vm: stopped waiting; the first boot continues. Run %s start to finish it.\n" "${0##*/}"; exit 130' INT
+  while vm_running; do
+    if line=$(grep -a -m1 -E "$firmware_stop" "$log" 2>/dev/null); then
+      line=${line%$'\r'}
+      printf '\nreims-vm: the first boot has reset the VM (%s)\n' "${line#ambrosia: }"
+      trap - INT
+      run_local -- "$bin/reims-ctl" stop --force "$VM" >/dev/null
+      return
+    fi
+    [[ ! -t 1 ]] || printf '\rreims-vm: waiting, %d min so far ' $(( (SECONDS - start) / 60 ))
+    read -r -t 10 <> <(:) || true
+  done
+  trap - INT
+  printf '\nreims-vm: the VM stopped during its first boot\n'
+}
+
+complete_first_boot() {
+  local out round=0 logs_were
+  logs_were=$(awk '/^\[logs\]/ { s = 1; next } /^\[/ { s = 0 } s && $1 == "enabled" { print $3 }' "$vm_dir/vm.toml")
+  while first_boot_pending; do
+    (( round++ < 6 )) || fail 'the first boot never finished; delete the VM and create it again, perhaps with another macOS version'
+    if vm_running; then
+      wait_for_first_boot
+      continue
+    fi
+    # Harmless when the first boot hasn't happened yet: finish refuses and changes nothing.
+    if out=$(run_local -- "$bin/reims-restore" finish-eacs "$vm_dir" 2>&1); then
+      first_boot_pending || break
+      printf 'reims-vm: macOS'"'"'s first boot failed; trying it again\n'
+    elif [[ $out != *"hasn't made its keys yet"* ]]; then
+      printf '%s\n' "$out" >&2
+      fail 'the first boot could not be finished; delete the VM and create it again, perhaps with another macOS version'
+    fi
+    # The firmware's stop line is only in the serial log, which logs on writes.
+    run_local -- "$bin/reims-ctl" set "$VM" --logs true >/dev/null
+    launch >/dev/null
+    wait_for_first_boot
+  done
+  [[ $logs_were == true ]] || run_local -- "$bin/reims-ctl" set "$VM" --logs false >/dev/null
+  printf 'reims-vm: first boot finished; starting macOS setup\n'
+}
+
+start_vm() {
+  check_settings
+  [[ -f $vm_dir/vm.toml ]] || fail "no VM named $VM yet: run ${0##*/} create"
+  ! first_boot_pending || complete_first_boot
+  launch
+  [[ -z $SHARE ]] || printf 'reims-vm: shared folder at %s (Finder: Go, Connect to Server, as Guest)\n' "$(share_url)"
+}
+
+case "$action" in
+  install) install_reims ;;
+  check)
+    run_local -- "$bin/reims-ctl" doctor
+    run_local -- "$bin/reims-ctl" gpus
+    ;;
+  create)
+    [[ $# -le 2 ]] || fail 'create takes one version, build, or IPSW path'
+    ipsw=${2:-latest}
+    if [[ $ipsw == */* || $ipsw == *.ipsw || -e $ipsw ]]; then
+      ipsw=$(realpath -e -- "$ipsw")
+    fi
+    [[ ! -f $vm_dir/vm.toml ]] || fail "$VM already exists; start it with ${0##*/} start"
+    if [[ ! -f $conf && -t 0 ]]; then
+      config_edit
+    fi
+    check_settings
+    vm_dir=$data/vms/$VM
+    if [[ ! -x $bin/reims-ctl || ! -x $bin/reims-restore || ! -f $packages/ready ]]; then
+      preflight || fail 'fix the items above, then run create again'
+      install_reims
+    fi
+    run_local -- "$bin/reims-ctl" create "$VM" --ipsw "$ipsw" --cpus "$CPUS" --memory "$MEMORY" --disk-size "$DISK"
+    run_local -- "$bin/reims-ctl" set "$VM" --capture false >/dev/null
+    start_vm
+    ;;
+  start) start_vm ;;
+  stop) run_local -- "$bin/reims-ctl" stop "$VM" ;;
+  diagnostics)
+    run_local -- "$bin/reims-ctl" set "$VM" --logs true --log-level info
+    ;;
+  list) run_local -- "$bin/reims-ctl" list ;;
+  ctl) shift; run_local -- "$bin/reims-ctl" "$@" ;;
+  backup)
+    # Reflink copy of the stopped VM, outside .state so rebuilding the toolchain can't touch it.
+    vm_dir=$data/vms/$VM
+    [[ -f $vm_dir/vm.toml ]] || fail "no VM at $vm_dir"
+    if [[ -f $vm_dir/qemu.pid ]] && kill -0 "$(cat "$vm_dir/qemu.pid")" 2>/dev/null; then
+      fail "$VM is running: run ${0##*/} stop first"
+    fi
+    dest=$BACKUP_DIR/$VM-$(date +%Y%m%d-%H%M%S)
+    mkdir -p "$dest"
+    cp -a --reflink=always -- "$vm_dir"/{vm.toml,machine-identifier.bin,aux.img,aux.img.trimmed,disk.img} "$dest"/ ||
+      fail 'reflink copy failed (the backup folder must be on the same btrfs or XFS filesystem)'
+    cp -a -- "$state/config/vms.toml" "$dest"/
+    printf 'reims-vm: backed up %s to %s\n' "$VM" "$(realpath -- "$dest")"
+    ;;
+  *) usage >&2; exit 2 ;;
+esac
